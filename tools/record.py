@@ -13,7 +13,7 @@ import io
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PIL import Image
 
@@ -86,6 +86,30 @@ async def _record_browser(url: str, duration: float, fps: int) -> str:
                 await asyncio.sleep(min(interval, remaining))
 
         await browser.close()
+
+    _frames_to_gif(frames, out, fps)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Session-based recording (uses an existing Playwright Page)
+# ---------------------------------------------------------------------------
+
+
+async def _record_page(page: Any, duration: float, fps: int) -> str:
+    """Record a GIF from an already-open Playwright page."""
+    interval = 1.0 / fps
+    frames: list[Image.Image] = []
+    out = str(_output_path("session_rec", "gif"))
+
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        png_bytes = await page.screenshot()
+        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        frames.append(img.quantize(colors=256))
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(min(interval, remaining))
 
     _frames_to_gif(frames, out, fps)
     return out

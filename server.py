@@ -1,5 +1,5 @@
 """
-opencode-vision-mcp — MCP server exposing screenshot and record tools.
+opencode-vision-mcp — MCP server exposing screenshot, record, and browser session tools.
 
 Usage:
     python server.py
@@ -17,6 +17,7 @@ Configure in opencode.jsonc:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import Any, Optional
 
@@ -29,8 +30,15 @@ from mcp.types import (
     Tool,
 )
 
-from tools.record import record_gif
-from tools.screenshot import take_screenshot
+from tools.record import record_gif, _record_page
+from tools.screenshot import take_screenshot, _screenshot_page
+from tools.browser_session import (
+    close_session,
+    interact,
+    is_session_open,
+    open_session,
+    get_page,
+)
 
 app = Server("opencode-vision")
 
@@ -38,6 +46,16 @@ app = Server("opencode-vision")
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
+
+_RETURN_INLINE_SCHEMA = {
+    "type": "boolean",
+    "description": (
+        "When true (default), the image is returned inline so vision-capable models "
+        "can see it directly. When false, only the file path is returned and the image "
+        "is saved to the tmp directory without being transmitted."
+    ),
+    "default": True,
+}
 
 SCREENSHOT_TOOL = Tool(
     name="screenshot",
@@ -64,6 +82,7 @@ SCREENSHOT_TOOL = Tool(
                 "description": "Seconds to wait before capturing (useful to let animations or page loads settle). Default: 0.",
                 "default": 0,
             },
+            "return_inline": _RETURN_INLINE_SCHEMA,
         },
     },
 )
@@ -98,6 +117,140 @@ RECORD_TOOL = Tool(
                 "description": "Frames per second for the GIF (lower = smaller file). Default: 5.",
                 "default": 5,
             },
+            "return_inline": _RETURN_INLINE_SCHEMA,
+        },
+    },
+)
+
+BROWSER_OPEN_TOOL = Tool(
+    name="browser_open",
+    description=(
+        "Open a persistent Playwright browser session and navigate to a URL. "
+        "The session stays alive between tool calls so you can click around, "
+        "take screenshots, record GIFs, and interact with the page. "
+        "If a session is already open, it is closed and replaced. "
+        "Always call browser_close when you are done."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The URL to navigate to.",
+            },
+            "width": {
+                "type": "integer",
+                "description": "Viewport width in pixels. Default: 1280.",
+                "default": 1280,
+            },
+            "height": {
+                "type": "integer",
+                "description": "Viewport height in pixels. Default: 900.",
+                "default": 900,
+            },
+        },
+    },
+)
+
+BROWSER_CLOSE_TOOL = Tool(
+    name="browser_close",
+    description=(
+        "Close the active Playwright browser session and free all resources. "
+        "Call this when you are done interacting with the browser."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {},
+    },
+)
+
+BROWSER_SCREENSHOT_TOOL = Tool(
+    name="browser_screenshot",
+    description=(
+        "Take a screenshot of the currently active browser session page. "
+        "Requires an open session (call browser_open first)."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "delay": {
+                "type": "number",
+                "description": "Seconds to wait before capturing. Default: 0.",
+                "default": 0,
+            },
+            "return_inline": _RETURN_INLINE_SCHEMA,
+        },
+    },
+)
+
+BROWSER_RECORD_TOOL = Tool(
+    name="browser_record",
+    description=(
+        "Record a short animated GIF of the currently active browser session page. "
+        "Requires an open session (call browser_open first). "
+        "Keep duration short (2-5s) and fps low (3-8) for LLM-friendly file sizes."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "duration": {
+                "type": "number",
+                "description": "How many seconds to record. Default: 3.",
+                "default": 3,
+            },
+            "fps": {
+                "type": "integer",
+                "description": "Frames per second for the GIF. Default: 5.",
+                "default": 5,
+            },
+            "return_inline": _RETURN_INLINE_SCHEMA,
+        },
+    },
+)
+
+BROWSER_INTERACT_TOOL = Tool(
+    name="browser_interact",
+    description=(
+        "Perform an interaction (click, type, scroll, hover) on the active browser session page. "
+        "Requires an open session (call browser_open first). "
+        "After interacting, use browser_screenshot to see the result."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["action"],
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["click", "type", "scroll", "hover"],
+                "description": "The type of interaction to perform.",
+            },
+            "selector": {
+                "type": "string",
+                "description": "CSS selector to target. Takes priority over x/y coordinates.",
+            },
+            "x": {
+                "type": "number",
+                "description": "Page X coordinate (used when selector is not provided).",
+            },
+            "y": {
+                "type": "number",
+                "description": "Page Y coordinate (used when selector is not provided).",
+            },
+            "text": {
+                "type": "string",
+                "description": "Text to type. Required for the 'type' action.",
+            },
+            "delta_x": {
+                "type": "number",
+                "description": "Horizontal scroll amount in pixels. Default: 0.",
+                "default": 0,
+            },
+            "delta_y": {
+                "type": "number",
+                "description": "Vertical scroll amount in pixels. Default: 0.",
+                "default": 0,
+            },
         },
     },
 )
@@ -110,7 +263,15 @@ RECORD_TOOL = Tool(
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    return [SCREENSHOT_TOOL, RECORD_TOOL]
+    return [
+        SCREENSHOT_TOOL,
+        RECORD_TOOL,
+        BROWSER_OPEN_TOOL,
+        BROWSER_CLOSE_TOOL,
+        BROWSER_SCREENSHOT_TOOL,
+        BROWSER_RECORD_TOOL,
+        BROWSER_INTERACT_TOOL,
+    ]
 
 
 @app.call_tool()
@@ -121,14 +282,66 @@ async def call_tool(
         return await _handle_screenshot(arguments)
     elif name == "record":
         return await _handle_record(arguments)
+    elif name == "browser_open":
+        return await _handle_browser_open(arguments)
+    elif name == "browser_close":
+        return await _handle_browser_close(arguments)
+    elif name == "browser_screenshot":
+        return await _handle_browser_screenshot(arguments)
+    elif name == "browser_record":
+        return await _handle_browser_record(arguments)
+    elif name == "browser_interact":
+        return await _handle_browser_interact(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_inline_png(file_path: str) -> Optional[ImageContent]:
+    """Read a PNG file and return an ImageContent block, or None on error."""
+    try:
+        import base64
+
+        with open(file_path, "rb") as f:
+            data = base64.standard_b64encode(f.read()).decode("utf-8")
+        return ImageContent(type="image", data=data, mimeType="image/png")
+    except Exception:
+        return None
+
+
+def _make_inline_gif_frame(file_path: str) -> Optional[ImageContent]:
+    """Extract the first frame of a GIF as PNG and return an ImageContent, or None on error."""
+    try:
+        import base64
+        import io
+
+        from PIL import Image
+
+        with Image.open(file_path) as gif:
+            gif.seek(0)
+            frame = gif.convert("RGB")
+            buf = io.BytesIO()
+            frame.save(buf, format="PNG")
+            data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        return ImageContent(type="image", data=data, mimeType="image/png")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# screenshot handler
+# ---------------------------------------------------------------------------
 
 
 async def _handle_screenshot(args: dict[str, Any]) -> list[TextContent | ImageContent]:
     url: Optional[str] = args.get("url")
     window_title: Optional[str] = args.get("window_title")
     delay: float = float(args.get("delay", 0))
+    return_inline: bool = bool(args.get("return_inline", True))
 
     try:
         result = await take_screenshot(url=url, window_title=window_title, delay=delay)
@@ -150,17 +363,17 @@ async def _handle_screenshot(args: dict[str, Any]) -> list[TextContent | ImageCo
     summary = f"Screenshot saved.\n  file_path : {file_path}\n  source    : {source}\n"
     parts.append(TextContent(type="text", text=summary))
 
-    # Also return the image inline so vision-capable models can see it directly
-    try:
-        import base64
-
-        with open(file_path, "rb") as f:
-            data = base64.standard_b64encode(f.read()).decode("utf-8")
-        parts.append(ImageContent(type="image", data=data, mimeType="image/png"))
-    except Exception:
-        pass  # Inline image is best-effort; the file path is always returned
+    if return_inline:
+        inline = _make_inline_png(file_path)
+        if inline:
+            parts.append(inline)
 
     return parts
+
+
+# ---------------------------------------------------------------------------
+# record handler
+# ---------------------------------------------------------------------------
 
 
 async def _handle_record(args: dict[str, Any]) -> list[TextContent | ImageContent]:
@@ -168,6 +381,7 @@ async def _handle_record(args: dict[str, Any]) -> list[TextContent | ImageConten
     window_title: Optional[str] = args.get("window_title")
     duration: float = float(args.get("duration", 3))
     fps: int = int(args.get("fps", 5))
+    return_inline: bool = bool(args.get("return_inline", True))
 
     # Clamp to sane limits
     duration = max(0.5, min(duration, 30))
@@ -191,8 +405,6 @@ async def _handle_record(args: dict[str, Any]) -> list[TextContent | ImageConten
     source: str = result["source"]
     frame_count: int = result["frame_count"]
 
-    import os
-
     try:
         size_kb = os.path.getsize(file_path) // 1024
         size_str = f"{size_kb} KB"
@@ -209,24 +421,212 @@ async def _handle_record(args: dict[str, Any]) -> list[TextContent | ImageConten
     )
     parts.append(TextContent(type="text", text=summary))
 
-    # Return first frame inline as PNG for models that support image content
-    try:
-        import base64
-        import io
-
-        from PIL import Image
-
-        with Image.open(file_path) as gif:
-            gif.seek(0)
-            frame = gif.convert("RGB")
-            buf = io.BytesIO()
-            frame.save(buf, format="PNG")
-            data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
-        parts.append(ImageContent(type="image", data=data, mimeType="image/png"))
-    except Exception:
-        pass  # Best-effort
+    if return_inline:
+        inline = _make_inline_gif_frame(file_path)
+        if inline:
+            parts.append(inline)
 
     return parts
+
+
+# ---------------------------------------------------------------------------
+# browser_open handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_open(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    url: str = args["url"]
+    width: int = int(args.get("width", 1280))
+    height: int = int(args.get("height", 900))
+
+    try:
+        result = await open_session(url=url, width=width, height=height)
+    except RuntimeError as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+    except Exception as exc:
+        return [
+            TextContent(type="text", text=f"Unexpected error opening browser: {exc}")
+        ]
+
+    summary = (
+        f"Browser session opened.\n"
+        f"  url    : {result['url']}\n"
+        f"  size   : {result['width']}x{result['height']}\n"
+    )
+    return [TextContent(type="text", text=summary)]
+
+
+# ---------------------------------------------------------------------------
+# browser_close handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_close(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    try:
+        result = await close_session()
+    except Exception as exc:
+        return [
+            TextContent(type="text", text=f"Unexpected error closing browser: {exc}")
+        ]
+
+    if result["status"] == "no_session":
+        return [TextContent(type="text", text="No active browser session to close.")]
+
+    return [TextContent(type="text", text="Browser session closed.")]
+
+
+# ---------------------------------------------------------------------------
+# browser_screenshot handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_screenshot(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    delay: float = float(args.get("delay", 0))
+    return_inline: bool = bool(args.get("return_inline", True))
+
+    page = get_page()
+    if page is None:
+        return [
+            TextContent(
+                type="text",
+                text="Error: No active browser session. Call browser_open first.",
+            )
+        ]
+
+    try:
+        file_path = await _screenshot_page(page, delay=delay)
+    except Exception as exc:
+        return [
+            TextContent(
+                type="text", text=f"Unexpected error taking browser screenshot: {exc}"
+            )
+        ]
+
+    parts: list[TextContent | ImageContent] = []
+    summary = (
+        f"Browser screenshot saved.\n"
+        f"  file_path : {file_path}\n"
+        f"  url       : {page.url}\n"
+    )
+    parts.append(TextContent(type="text", text=summary))
+
+    if return_inline:
+        inline = _make_inline_png(file_path)
+        if inline:
+            parts.append(inline)
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# browser_record handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_record(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    duration: float = float(args.get("duration", 3))
+    fps: int = int(args.get("fps", 5))
+    return_inline: bool = bool(args.get("return_inline", True))
+
+    # Clamp to sane limits
+    duration = max(0.5, min(duration, 30))
+    fps = max(1, min(fps, 30))
+
+    page = get_page()
+    if page is None:
+        return [
+            TextContent(
+                type="text",
+                text="Error: No active browser session. Call browser_open first.",
+            )
+        ]
+
+    try:
+        file_path = await _record_page(page, duration=duration, fps=fps)
+    except Exception as exc:
+        return [
+            TextContent(
+                type="text", text=f"Unexpected error recording browser GIF: {exc}"
+            )
+        ]
+
+    parts: list[TextContent | ImageContent] = []
+
+    try:
+        size_kb = os.path.getsize(file_path) // 1024
+        size_str = f"{size_kb} KB"
+    except OSError:
+        size_str = "unknown"
+
+    frame_count = max(1, int(duration * fps))
+    summary = (
+        f"Browser recording saved.\n"
+        f"  file_path  : {file_path}\n"
+        f"  url        : {page.url}\n"
+        f"  frames     : {frame_count}\n"
+        f"  duration   : {duration}s @ {fps} fps\n"
+        f"  size       : {size_str}\n"
+    )
+    parts.append(TextContent(type="text", text=summary))
+
+    if return_inline:
+        inline = _make_inline_gif_frame(file_path)
+        if inline:
+            parts.append(inline)
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# browser_interact handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_interact(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    action: str = args.get("action", "")
+    selector: Optional[str] = args.get("selector")
+    x: Optional[float] = args.get("x")
+    y: Optional[float] = args.get("y")
+    text: Optional[str] = args.get("text")
+    delta_x: float = float(args.get("delta_x", 0))
+    delta_y: float = float(args.get("delta_y", 0))
+
+    try:
+        result = await interact(
+            action=action,  # type: ignore[arg-type]
+            selector=selector,
+            x=x,
+            y=y,
+            text=text,
+            delta_x=delta_x,
+            delta_y=delta_y,
+        )
+    except RuntimeError as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"Invalid arguments: {exc}")]
+    except Exception as exc:
+        return [
+            TextContent(type="text", text=f"Unexpected error during interaction: {exc}")
+        ]
+
+    summary = (
+        f"Interaction complete.\n"
+        f"  action : {result['action']}\n"
+        f"  detail : {result['detail']}\n"
+        f"  url    : {result['url']}\n"
+    )
+    return [TextContent(type="text", text=summary)]
 
 
 # ---------------------------------------------------------------------------

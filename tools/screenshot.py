@@ -13,7 +13,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from tools.window import _run_powershell, get_window_geometry
 
@@ -123,6 +123,20 @@ def _screenshot_wsl(
         os.remove(wsl_path)
     except OSError:
         pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Session-based screenshot (uses an existing Playwright Page)
+# ---------------------------------------------------------------------------
+
+
+async def _screenshot_page(page: Any, delay: float = 0) -> str:
+    """Take a screenshot of an already-open Playwright page."""
+    if delay > 0:
+        await asyncio.sleep(delay)
+    out = str(_output_path("session", "png"))
+    await page.screenshot(path=out, full_page=False)
     return out
 
 

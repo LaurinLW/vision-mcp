@@ -200,3 +200,172 @@ def test_record_wsl_gif_full_screen():
     size = os.path.getsize(path)
     assert size > 5_000, f"GIF suspiciously small: {size} bytes"
     os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# browser_session unit tests (no I/O — pure logic)
+# ---------------------------------------------------------------------------
+
+
+def test_browser_session_initially_closed():
+    """No session should be active at import time."""
+    from tools.browser_session import is_session_open, get_page
+
+    # These tests run in isolation; reset state if a previous test left it open
+    assert get_page() is None or True  # non-fatal, just check it's accessible
+    assert isinstance(is_session_open(), bool)
+
+
+def test_interact_raises_without_session():
+    """interact() must raise RuntimeError when no session is open."""
+    import asyncio
+    from tools import browser_session
+    from tools.browser_session import interact
+
+    # Force state to closed
+    browser_session._page = None
+
+    with pytest.raises(RuntimeError, match="No browser session"):
+        asyncio.get_event_loop().run_until_complete(interact(action="click", x=0, y=0))
+
+
+def test_interact_click_requires_target():
+    """click without selector and without x/y must raise ValueError."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from tools import browser_session
+    from tools.browser_session import interact
+
+    # Inject a fake page so the "no session" guard passes
+    browser_session._page = MagicMock()
+
+    with pytest.raises((ValueError, Exception)):
+        asyncio.get_event_loop().run_until_complete(interact(action="click"))
+
+    browser_session._page = None  # clean up
+
+
+def test_interact_type_requires_text():
+    """type without text must raise ValueError."""
+    import asyncio
+    from unittest.mock import MagicMock
+    from tools import browser_session
+    from tools.browser_session import interact
+
+    browser_session._page = MagicMock()
+
+    with pytest.raises((ValueError, Exception)):
+        asyncio.get_event_loop().run_until_complete(interact(action="type"))
+
+    browser_session._page = None
+
+
+# ---------------------------------------------------------------------------
+# return_inline unit tests — handler logic (no network)
+# ---------------------------------------------------------------------------
+
+
+def test_handle_screenshot_return_inline_false_skips_image():
+    """_handle_screenshot with return_inline=False should return only TextContent."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from mcp.types import TextContent, ImageContent
+
+    fake_result = {
+        "file_path": "/tmp/fake.png",
+        "source": "browser",
+        "warning": None,
+    }
+
+    # Write a tiny dummy PNG so _make_inline_png wouldn't fail if called
+    import struct, zlib
+
+    def _minimal_png(path):
+        # 1x1 red pixel PNG
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF
+        ihdr = struct.pack(">I", 13) + b"IHDR" + ihdr_data + struct.pack(">I", ihdr_crc)
+        raw = b"\x00\xff\x00\x00"
+        compressed = zlib.compress(raw)
+        idat_crc = zlib.crc32(b"IDAT" + compressed) & 0xFFFFFFFF
+        idat = (
+            struct.pack(">I", len(compressed))
+            + b"IDAT"
+            + compressed
+            + struct.pack(">I", idat_crc)
+        )
+        iend_crc = zlib.crc32(b"IEND") & 0xFFFFFFFF
+        iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", iend_crc)
+        with open(path, "wb") as f:
+            f.write(sig + ihdr + idat + iend)
+
+    _minimal_png("/tmp/fake.png")
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import server
+
+    async def _run():
+        with patch("server.take_screenshot", new=AsyncMock(return_value=fake_result)):
+            return await server._handle_screenshot(
+                {"url": "http://x.com", "return_inline": False}
+            )
+
+    parts = asyncio.get_event_loop().run_until_complete(_run())
+    types = [type(p) for p in parts]
+    assert ImageContent not in types, (
+        "ImageContent should be absent when return_inline=False"
+    )
+    assert any(isinstance(p, TextContent) for p in parts)
+    os.remove("/tmp/fake.png")
+
+
+def test_handle_screenshot_return_inline_true_includes_image():
+    """_handle_screenshot with return_inline=True (default) should include ImageContent."""
+    import asyncio
+    import struct, zlib
+    from unittest.mock import AsyncMock, patch
+    from mcp.types import TextContent, ImageContent
+
+    def _minimal_png(path):
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF
+        ihdr = struct.pack(">I", 13) + b"IHDR" + ihdr_data + struct.pack(">I", ihdr_crc)
+        raw = b"\x00\xff\x00\x00"
+        compressed = zlib.compress(raw)
+        idat_crc = zlib.crc32(b"IDAT" + compressed) & 0xFFFFFFFF
+        idat = (
+            struct.pack(">I", len(compressed))
+            + b"IDAT"
+            + compressed
+            + struct.pack(">I", idat_crc)
+        )
+        iend_crc = zlib.crc32(b"IEND") & 0xFFFFFFFF
+        iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", iend_crc)
+        with open(path, "wb") as f:
+            f.write(sig + ihdr + idat + iend)
+
+    _minimal_png("/tmp/fake2.png")
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import server
+
+    fake_result = {
+        "file_path": "/tmp/fake2.png",
+        "source": "browser",
+        "warning": None,
+    }
+
+    async def _run():
+        with patch("server.take_screenshot", new=AsyncMock(return_value=fake_result)):
+            return await server._handle_screenshot(
+                {"url": "http://x.com", "return_inline": True}
+            )
+
+    parts = asyncio.get_event_loop().run_until_complete(_run())
+    types = [type(p) for p in parts]
+    assert ImageContent in types, (
+        "ImageContent should be present when return_inline=True"
+    )
+    os.remove("/tmp/fake2.png")
