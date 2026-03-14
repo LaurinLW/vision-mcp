@@ -42,6 +42,8 @@ from tools.browser_session import (
     evaluate,
 )
 from tools.diff import screenshot_diff
+from tools.dom import get_dom
+from tools.pdf import export_pdf
 
 app = Server("opencode-vision")
 
@@ -357,6 +359,76 @@ SCREENSHOT_DIFF_TOOL = Tool(
     },
 )
 
+BROWSER_GET_DOM_TOOL = Tool(
+    name="browser_get_dom",
+    description=(
+        "Extract structured DOM content from the active browser page — title, plain text, "
+        "links, form inputs, and headings — returned as structured text. "
+        "Much faster than screenshotting when you need to read page content, find links, "
+        "inspect form fields, or verify what text is present. "
+        "Requires an open session (call browser_open first). "
+        "Use 'selector_scope' to narrow extraction to a specific element (e.g. 'main', '#content'). "
+        "Use 'max_text_length' to control how much body text is returned."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "selector_scope": {
+                "type": "string",
+                "description": (
+                    "CSS selector scoping all extraction. Default: 'body'. "
+                    "Use 'main', '#content', '.article', etc. to narrow to a region."
+                ),
+                "default": "body",
+            },
+            "max_text_length": {
+                "type": "integer",
+                "description": (
+                    "Maximum characters of plain text to return. "
+                    "Text beyond this limit is truncated. Default: 5000."
+                ),
+                "default": 5000,
+            },
+        },
+    },
+)
+
+BROWSER_PDF_TOOL = Tool(
+    name="browser_pdf",
+    description=(
+        "Export the active browser page as a PDF file. "
+        "Uses Chromium's print engine — respects CSS print media queries and page breaks. "
+        "Requires an open session (call browser_open first). "
+        "Returns the file path and size of the generated PDF."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "format": {
+                "type": "string",
+                "enum": ["A4", "Letter", "A3"],
+                "description": "Paper size. Default: 'A4'.",
+                "default": "A4",
+            },
+            "landscape": {
+                "type": "boolean",
+                "description": "Print in landscape orientation. Default: false.",
+                "default": False,
+            },
+            "print_background": {
+                "type": "boolean",
+                "description": "Include background colors and images. Default: true.",
+                "default": True,
+            },
+            "scale": {
+                "type": "number",
+                "description": "CSS zoom level, 0.1–2.0. Default: 1.0.",
+                "default": 1.0,
+            },
+        },
+    },
+)
+
 BROWSER_NAVIGATE_TOOL = Tool(
     name="browser_navigate",
     description=(
@@ -459,6 +531,8 @@ async def list_tools() -> list[Tool]:
         BROWSER_EVALUATE_TOOL,
         SCREENSHOT_DIFF_TOOL,
         BROWSER_NAVIGATE_TOOL,
+        BROWSER_GET_DOM_TOOL,
+        BROWSER_PDF_TOOL,
     ]
 
 
@@ -486,6 +560,10 @@ async def call_tool(
         return await _handle_screenshot_diff(arguments)
     elif name == "browser_navigate":
         return await _handle_browser_navigate(arguments)
+    elif name == "browser_get_dom":
+        return await _handle_browser_get_dom(arguments)
+    elif name == "browser_pdf":
+        return await _handle_browser_pdf(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -1004,6 +1082,89 @@ async def _handle_browser_navigate(
             )
 
     return parts
+
+
+# ---------------------------------------------------------------------------
+# browser_get_dom handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_get_dom(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    selector_scope: str = args.get("selector_scope", "body")
+    max_text_length: int = int(args.get("max_text_length", 5000))
+
+    try:
+        result = await get_dom(
+            selector_scope=selector_scope, max_text_length=max_text_length
+        )
+    except RuntimeError as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+    except Exception as exc:
+        return [
+            TextContent(type="text", text=f"Unexpected error extracting DOM: {exc}")
+        ]
+
+    import json as _json
+
+    links_str = _json.dumps(result["links"], ensure_ascii=False, indent=2)
+    inputs_str = _json.dumps(result["inputs"], ensure_ascii=False, indent=2)
+    headings_str = _json.dumps(result["headings"], ensure_ascii=False, indent=2)
+
+    truncation_note = " [truncated]" if result["truncated"] else ""
+
+    summary = (
+        f"DOM extracted.\n"
+        f"  url      : {result['url']}\n"
+        f"  title    : {result['title']}\n"
+        f"  scope    : {selector_scope}\n"
+        f"\n--- text{truncation_note} ---\n"
+        f"{result['text']}\n"
+        f"\n--- headings ---\n"
+        f"{headings_str}\n"
+        f"\n--- links ({len(result['links'])}) ---\n"
+        f"{links_str}\n"
+        f"\n--- inputs ({len(result['inputs'])}) ---\n"
+        f"{inputs_str}\n"
+    )
+    return [TextContent(type="text", text=summary)]
+
+
+# ---------------------------------------------------------------------------
+# browser_pdf handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_pdf(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    format: str = args.get("format", "A4")
+    landscape: bool = bool(args.get("landscape", False))
+    print_background: bool = bool(args.get("print_background", True))
+    scale: float = float(args.get("scale", 1.0))
+
+    try:
+        result = await export_pdf(
+            format=format,
+            landscape=landscape,
+            print_background=print_background,
+            scale=scale,
+        )
+    except RuntimeError as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Unexpected error exporting PDF: {exc}")]
+
+    size_kb = result["size_bytes"] // 1024
+    summary = (
+        f"PDF exported.\n"
+        f"  file_path  : {result['file_path']}\n"
+        f"  size       : {size_kb} KB ({result['size_bytes']} bytes)\n"
+        f"  url        : {result['url']}\n"
+        f"  format     : {format}{'  landscape' if landscape else ''}\n"
+    )
+    return [TextContent(type="text", text=summary)]
 
 
 # ---------------------------------------------------------------------------

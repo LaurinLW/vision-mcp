@@ -913,3 +913,209 @@ def test_handle_browser_evaluate_error_formats_output():
     text = parts[0].text
     assert "ReferenceError" in text
     assert "error" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# browser_get_dom unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_dom_raises_without_session():
+    """get_dom() must raise RuntimeError when no session is open."""
+    import asyncio
+    from tools import browser_session
+    from tools.dom import get_dom
+
+    browser_session._page = None
+
+    with pytest.raises(RuntimeError, match="No browser session"):
+        asyncio.get_event_loop().run_until_complete(get_dom())
+
+
+def test_get_dom_returns_expected_keys():
+    """get_dom() should return a dict with all expected keys."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from tools import browser_session
+    from tools.dom import get_dom
+
+    mock_page = MagicMock()
+    mock_page.title = AsyncMock(return_value="Test Page")
+    mock_page.inner_text = AsyncMock(return_value="Some body text")
+    mock_page.evaluate = AsyncMock(
+        side_effect=[
+            [{"text": "Example", "href": "https://example.com"}],  # links
+            [
+                {
+                    "tag": "input",
+                    "name": "q",
+                    "type": "text",
+                    "placeholder": "Search",
+                    "value": "",
+                    "id": "",
+                }
+            ],  # inputs
+            [{"level": 1, "text": "Hello"}],  # headings
+        ]
+    )
+    mock_page.url = "https://example.com"
+    browser_session._page = mock_page
+
+    result = asyncio.get_event_loop().run_until_complete(get_dom())
+
+    assert "url" in result
+    assert "title" in result
+    assert "text" in result
+    assert "truncated" in result
+    assert "links" in result
+    assert "inputs" in result
+    assert "headings" in result
+    assert result["title"] == "Test Page"
+    assert result["text"] == "Some body text"
+    assert result["truncated"] is False
+
+    browser_session._page = None
+
+
+def test_get_dom_truncates_long_text():
+    """get_dom() should truncate text longer than max_text_length."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from tools import browser_session
+    from tools.dom import get_dom
+
+    long_text = "x" * 10_000
+    mock_page = MagicMock()
+    mock_page.title = AsyncMock(return_value="T")
+    mock_page.inner_text = AsyncMock(return_value=long_text)
+    mock_page.evaluate = AsyncMock(side_effect=[[], [], []])
+    mock_page.url = "https://example.com"
+    browser_session._page = mock_page
+
+    result = asyncio.get_event_loop().run_until_complete(get_dom(max_text_length=100))
+
+    assert len(result["text"]) == 100
+    assert result["truncated"] is True
+
+    browser_session._page = None
+
+
+def test_handle_browser_get_dom_no_session():
+    """_handle_browser_get_dom should return an error TextContent when no session."""
+    import asyncio
+    from mcp.types import TextContent
+    from tools import browser_session
+    import server
+
+    browser_session._page = None
+
+    parts = asyncio.get_event_loop().run_until_complete(
+        server._handle_browser_get_dom({})
+    )
+    assert len(parts) == 1
+    assert isinstance(parts[0], TextContent)
+    assert "error" in parts[0].text.lower()
+
+    browser_session._page = None
+
+
+def test_handle_browser_get_dom_formats_output():
+    """_handle_browser_get_dom should format get_dom result as readable text."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from mcp.types import TextContent
+    import server
+
+    fake_result = {
+        "url": "https://example.com",
+        "title": "Example Domain",
+        "text": "This domain is for use in illustrative examples.",
+        "truncated": False,
+        "links": [{"text": "More info", "href": "https://iana.org"}],
+        "inputs": [],
+        "headings": [{"level": 1, "text": "Example Domain"}],
+    }
+
+    async def _run():
+        with patch("server.get_dom", new=AsyncMock(return_value=fake_result)):
+            return await server._handle_browser_get_dom({})
+
+    parts = asyncio.get_event_loop().run_until_complete(_run())
+    assert len(parts) == 1
+    assert isinstance(parts[0], TextContent)
+    text = parts[0].text
+    assert "Example Domain" in text
+    assert "More info" in text
+    assert "https://iana.org" in text
+
+
+@pytest.mark.asyncio
+async def test_browser_get_dom_live():
+    """browser_get_dom against example.com should return expected content."""
+    pytest.importorskip("playwright")
+    from tools import browser_session
+    from tools.dom import get_dom
+
+    await browser_session.open_session("https://example.com")
+    try:
+        result = await get_dom()
+        assert result["title"] == "Example Domain"
+        assert len(result["links"]) > 0
+        assert any(h["level"] == 1 for h in result["headings"])
+        assert "example" in result["text"].lower()
+        assert result["truncated"] is False
+    finally:
+        await browser_session.close_session()
+
+
+# ---------------------------------------------------------------------------
+# browser_pdf unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_pdf_raises_without_session():
+    """export_pdf() must raise RuntimeError when no session is open."""
+    import asyncio
+    from tools import browser_session
+    from tools.pdf import export_pdf
+
+    browser_session._page = None
+
+    with pytest.raises(RuntimeError, match="No browser session"):
+        asyncio.get_event_loop().run_until_complete(export_pdf())
+
+
+def test_handle_browser_pdf_no_session():
+    """_handle_browser_pdf should return an error TextContent when no session."""
+    import asyncio
+    from mcp.types import TextContent
+    from tools import browser_session
+    import server
+
+    browser_session._page = None
+
+    parts = asyncio.get_event_loop().run_until_complete(server._handle_browser_pdf({}))
+    assert len(parts) == 1
+    assert isinstance(parts[0], TextContent)
+    assert "error" in parts[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_browser_pdf_live():
+    """browser_pdf should export a non-empty PDF from example.com."""
+    pytest.importorskip("playwright")
+    from tools import browser_session
+    from tools.pdf import export_pdf
+
+    await browser_session.open_session("https://example.com")
+    result = None
+    try:
+        result = await export_pdf(format="A4", landscape=False)
+        assert os.path.exists(result["file_path"])
+        assert result["file_path"].endswith(".pdf")
+        assert result["size_bytes"] > 0
+        assert result["url"] == "https://example.com/"
+    finally:
+        if result and os.path.exists(result["file_path"]):
+            os.remove(result["file_path"])
+        await browser_session.close_session()

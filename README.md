@@ -112,6 +112,30 @@ Perform a single interaction on the active page.
 
 **`keyboard` key examples:** `Enter`, `Escape`, `Tab`, `Backspace`, `ArrowDown`, `Control+a`, `Control+z`, `Meta+r`, `Shift+Tab`, `F5`.
 
+#### `browser_get_dom`
+
+Extract structured DOM content from the active page — title, plain text, links, form inputs, and headings — as structured text. Much faster than screenshotting for reading page content, finding links, or inspecting forms.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `selector_scope` | string | CSS selector scoping all extraction (default: `body`). Use `main`, `#content`, etc. to narrow to a region. |
+| `max_text_length` | integer | Maximum characters of plain text to return (default: `5000`). Text beyond this is truncated. |
+
+Returns title, scoped text, links `[{text, href}]`, inputs `[{tag, name, type, placeholder, value, id}]`, and headings `[{level, text}]`.
+
+#### `browser_pdf`
+
+Export the active page as a PDF. Uses Chromium's print engine — respects CSS print media queries and page breaks.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `format` | enum | Paper size: `A4` \| `Letter` \| `A3` (default: `A4`). |
+| `landscape` | boolean | Print in landscape orientation (default: `false`). |
+| `print_background` | boolean | Include background colors and images (default: `true`). |
+| `scale` | number | CSS zoom level, 0.1–2.0 (default: `1.0`). |
+
+Returns `file_path`, `size_bytes`, and the page `url` at export time.
+
 #### `browser_navigate`
 
 Navigate to a URL and run an optional sequence of interactions in a **single tool call** — replaces the pattern of `browser_open` + N × `browser_interact` + `browser_screenshot`. Reuses an open session if available.
@@ -243,5 +267,7 @@ opencode-mcp/
     ├── screenshot.py           # screenshot tool implementation
     ├── record.py               # record tool implementation
     ├── diff.py                 # screenshot_diff implementation
+    ├── dom.py                  # browser_get_dom implementation
+    ├── pdf.py                  # browser_pdf implementation
     └── browser_session.py      # Persistent Playwright session + interact/navigate/evaluate
 ```
