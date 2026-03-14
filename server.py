@@ -38,7 +38,10 @@ from tools.browser_session import (
     is_session_open,
     open_session,
     get_page,
+    navigate,
+    evaluate,
 )
+from tools.diff import screenshot_diff
 
 app = Server("opencode-vision")
 
@@ -212,9 +215,12 @@ BROWSER_RECORD_TOOL = Tool(
 BROWSER_INTERACT_TOOL = Tool(
     name="browser_interact",
     description=(
-        "Perform an interaction (click, type, scroll, hover) on the active browser session page. "
+        "Perform an interaction (click, type, scroll, hover, wait, keyboard) on the active browser session page. "
         "Requires an open session (call browser_open first). "
-        "After interacting, use browser_screenshot to see the result."
+        "After interacting, use browser_screenshot to see the result. "
+        "Use action='wait' with a selector to pause until an element appears. "
+        "Use action='keyboard' to send key presses such as 'Enter', 'Escape', 'Tab', "
+        "'ArrowDown', 'Control+z', 'Meta+a', 'F5', etc."
     ),
     inputSchema={
         "type": "object",
@@ -222,7 +228,7 @@ BROWSER_INTERACT_TOOL = Tool(
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["click", "type", "scroll", "hover"],
+                "enum": ["click", "type", "scroll", "hover", "wait", "keyboard"],
                 "description": "The type of interaction to perform.",
             },
             "selector": {
@@ -241,6 +247,16 @@ BROWSER_INTERACT_TOOL = Tool(
                 "type": "string",
                 "description": "Text to type. Required for the 'type' action.",
             },
+            "key": {
+                "type": "string",
+                "description": (
+                    "Playwright key name to press. Required for the 'keyboard' action. "
+                    "Examples: 'Enter', 'Escape', 'Tab', 'Backspace', 'Delete', "
+                    "'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', "
+                    "'Control+a', 'Control+z', 'Control+c', 'Control+v', "
+                    "'Meta+a', 'Meta+z', 'Shift+Tab', 'F5'."
+                ),
+            },
             "delta_x": {
                 "type": "number",
                 "description": "Horizontal scroll amount in pixels. Default: 0.",
@@ -251,6 +267,175 @@ BROWSER_INTERACT_TOOL = Tool(
                 "description": "Vertical scroll amount in pixels. Default: 0.",
                 "default": 0,
             },
+            "timeout": {
+                "type": "number",
+                "description": "Max wait time in ms for the 'wait' action. Default: 5000.",
+                "default": 5000,
+            },
+        },
+    },
+)
+
+BROWSER_EVALUATE_TOOL = Tool(
+    name="browser_evaluate",
+    description=(
+        "Execute JavaScript in the active browser session page context and return the result. "
+        "Requires an open session (call browser_open first). "
+        "Use this to: read DOM state (document.title, element text, computed styles), "
+        "check application data (localStorage, sessionStorage, window variables), "
+        "trigger events that browser_interact cannot (custom events, drag-and-drop), "
+        "or verify conditions programmatically without taking a screenshot. "
+        "The expression can be a simple JS expression ('document.title'), "
+        "an arrow function ('() => window.location.pathname'), "
+        "or a function that accepts an argument ('(n) => n * 2', paired with 'arg'). "
+        "Returns the result value, its JS type, and any error message."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["expression"],
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": (
+                    "JavaScript expression or function to evaluate in the page. "
+                    "Examples:\n"
+                    "  'document.title'\n"
+                    "  '() => document.querySelectorAll(\".error\").length'\n"
+                    "  '() => JSON.parse(localStorage.getItem(\"user\"))'\n"
+                    "  '() => window.getComputedStyle(document.body).backgroundColor'\n"
+                    "  '(sel) => document.querySelector(sel)?.textContent' (use with arg)"
+                ),
+            },
+            "arg": {
+                "description": (
+                    "Optional JSON-serializable value passed as the sole argument "
+                    "when expression is a function. Default: null (not passed)."
+                ),
+            },
+        },
+    },
+)
+
+SCREENSHOT_DIFF_TOOL = Tool(
+    name="screenshot_diff",
+    description=(
+        "Compute a visual diff between two screenshots and return a side-by-side PNG "
+        "with changed pixels highlighted. "
+        "Each input can be a local file path (from a previous screenshot tool call) or a URL "
+        "(which will be screenshotted automatically). "
+        "The result image shows the 'before' panel on the left and the 'after' panel on the right "
+        "with changed areas highlighted in the specified color. "
+        "Also returns statistics: changed_pixels, total_pixels, and change_percent."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["before", "after"],
+        "properties": {
+            "before": {
+                "type": "string",
+                "description": "File path or URL of the 'before' image.",
+            },
+            "after": {
+                "type": "string",
+                "description": "File path or URL of the 'after' image.",
+            },
+            "highlight_color": {
+                "type": "string",
+                "description": "Hex color used to highlight changed pixels. Default: '#ff0000' (red).",
+                "default": "#ff0000",
+            },
+            "threshold": {
+                "type": "integer",
+                "description": (
+                    "Per-channel difference (0-255) below which a pixel is considered unchanged. "
+                    "Higher values ignore minor rendering differences. Default: 10."
+                ),
+                "default": 10,
+            },
+            "return_inline": _RETURN_INLINE_SCHEMA,
+        },
+    },
+)
+
+BROWSER_NAVIGATE_TOOL = Tool(
+    name="browser_navigate",
+    description=(
+        "Navigate to a URL and optionally execute a sequence of interactions in a single tool call. "
+        "Replaces the pattern of browser_open + multiple browser_interact + browser_screenshot calls. "
+        "Reuses an existing browser session if one is open; otherwise opens a new one. "
+        "Each step can optionally capture an intermediate screenshot by setting 'screenshot: true'. "
+        "A final screenshot is taken after all steps by default. "
+        "Supports a 'wait' step action to pause until a CSS selector appears in the DOM."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "URL to navigate to.",
+            },
+            "steps": {
+                "type": "array",
+                "description": (
+                    "Optional list of interaction steps to execute in order after navigation. "
+                    "Each step is an object with 'action' (click|type|scroll|hover|wait) "
+                    "and the same parameters as browser_interact, plus an optional "
+                    "'screenshot' boolean to capture an intermediate PNG after that step."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "click",
+                                "type",
+                                "scroll",
+                                "hover",
+                                "wait",
+                                "keyboard",
+                            ],
+                        },
+                        "selector": {"type": "string"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "text": {"type": "string"},
+                        "key": {"type": "string"},
+                        "delta_x": {"type": "number", "default": 0},
+                        "delta_y": {"type": "number", "default": 0},
+                        "timeout": {"type": "number", "default": 5000},
+                        "screenshot": {
+                            "type": "boolean",
+                            "description": "Capture a screenshot after this step.",
+                            "default": False,
+                        },
+                    },
+                },
+            },
+            "screenshot_after": {
+                "type": "boolean",
+                "description": "Take a final screenshot after all steps complete. Default: true.",
+                "default": True,
+            },
+            "wait_for": {
+                "type": "string",
+                "enum": ["networkidle", "domcontentloaded", "load"],
+                "description": "Page load event to wait for after navigation. Default: 'networkidle'.",
+                "default": "networkidle",
+            },
+            "width": {
+                "type": "integer",
+                "description": "Viewport width in pixels (only used when opening a new session). Default: 1280.",
+                "default": 1280,
+            },
+            "height": {
+                "type": "integer",
+                "description": "Viewport height in pixels (only used when opening a new session). Default: 900.",
+                "default": 900,
+            },
+            "return_inline": _RETURN_INLINE_SCHEMA,
         },
     },
 )
@@ -271,6 +456,9 @@ async def list_tools() -> list[Tool]:
         BROWSER_SCREENSHOT_TOOL,
         BROWSER_RECORD_TOOL,
         BROWSER_INTERACT_TOOL,
+        BROWSER_EVALUATE_TOOL,
+        SCREENSHOT_DIFF_TOOL,
+        BROWSER_NAVIGATE_TOOL,
     ]
 
 
@@ -292,6 +480,12 @@ async def call_tool(
         return await _handle_browser_record(arguments)
     elif name == "browser_interact":
         return await _handle_browser_interact(arguments)
+    elif name == "browser_evaluate":
+        return await _handle_browser_evaluate(arguments)
+    elif name == "screenshot_diff":
+        return await _handle_screenshot_diff(arguments)
+    elif name == "browser_navigate":
+        return await _handle_browser_navigate(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -598,8 +792,10 @@ async def _handle_browser_interact(
     x: Optional[float] = args.get("x")
     y: Optional[float] = args.get("y")
     text: Optional[str] = args.get("text")
+    key: Optional[str] = args.get("key")
     delta_x: float = float(args.get("delta_x", 0))
     delta_y: float = float(args.get("delta_y", 0))
+    timeout: float = float(args.get("timeout", 5000))
 
     try:
         result = await interact(
@@ -608,8 +804,10 @@ async def _handle_browser_interact(
             x=x,
             y=y,
             text=text,
+            key=key,
             delta_x=delta_x,
             delta_y=delta_y,
+            timeout=timeout,
         )
     except RuntimeError as exc:
         return [TextContent(type="text", text=f"Error: {exc}")]
@@ -627,6 +825,185 @@ async def _handle_browser_interact(
         f"  url    : {result['url']}\n"
     )
     return [TextContent(type="text", text=summary)]
+
+
+# ---------------------------------------------------------------------------
+# browser_evaluate handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_evaluate(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    expression: Optional[str] = args.get("expression")
+    arg = args.get("arg")  # any JSON value; None means "don't pass an arg"
+
+    if not expression:
+        return [TextContent(type="text", text="Error: 'expression' is required.")]
+
+    try:
+        result = await evaluate(expression=expression, arg=arg)
+    except RuntimeError as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+    except Exception as exc:
+        return [
+            TextContent(type="text", text=f"Unexpected error during evaluate: {exc}")
+        ]
+
+    if result["error"] is not None:
+        summary = (
+            f"JavaScript error.\n"
+            f"  error : {result['error']}\n"
+            f"  url   : {result['url']}\n"
+        )
+    else:
+        import json as _json
+
+        # Pretty-print objects/arrays; keep scalars on one line
+        raw = result["result"]
+        if isinstance(raw, (dict, list)):
+            result_str = _json.dumps(raw, indent=2, ensure_ascii=False)
+        else:
+            result_str = str(raw) if raw is not None else "null"
+
+        summary = (
+            f"JavaScript evaluated successfully.\n"
+            f"  result : {result_str}\n"
+            f"  type   : {result['type']}\n"
+            f"  url    : {result['url']}\n"
+        )
+
+    return [TextContent(type="text", text=summary)]
+
+
+# ---------------------------------------------------------------------------
+# screenshot_diff handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_screenshot_diff(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    before: Optional[str] = args.get("before")
+    after: Optional[str] = args.get("after")
+    highlight_color: str = args.get("highlight_color", "#ff0000")
+    threshold: int = int(args.get("threshold", 10))
+    return_inline: bool = bool(args.get("return_inline", True))
+
+    if not before or not after:
+        return [
+            TextContent(type="text", text="Error: 'before' and 'after' are required.")
+        ]
+
+    try:
+        result = await screenshot_diff(
+            before=before,
+            after=after,
+            highlight_color=highlight_color,
+            threshold=threshold,
+        )
+    except FileNotFoundError as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+    except Exception as exc:
+        return [
+            TextContent(type="text", text=f"Unexpected error computing diff: {exc}")
+        ]
+
+    file_path: str = result["file_path"]
+    changed: int = result["changed_pixels"]
+    total: int = result["total_pixels"]
+    pct: float = result["change_percent"]
+
+    summary = (
+        f"Diff saved.\n"
+        f"  file_path      : {file_path}\n"
+        f"  changed_pixels : {changed:,} / {total:,}\n"
+        f"  change_percent : {pct}%\n"
+    )
+    parts: list[TextContent | ImageContent] = [TextContent(type="text", text=summary)]
+
+    if return_inline:
+        inline = _make_inline_png(file_path)
+        if inline:
+            parts.append(inline)
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# browser_navigate handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_browser_navigate(
+    args: dict[str, Any],
+) -> list[TextContent | ImageContent]:
+    url: str = args.get("url", "")
+    steps: list = args.get("steps", [])
+    screenshot_after: bool = bool(args.get("screenshot_after", True))
+    wait_for: str = args.get("wait_for", "networkidle")
+    width: int = int(args.get("width", 1280))
+    height: int = int(args.get("height", 900))
+    return_inline: bool = bool(args.get("return_inline", True))
+
+    if not url:
+        return [TextContent(type="text", text="Error: 'url' is required.")]
+
+    try:
+        result = await navigate(
+            url=url,
+            steps=steps,
+            screenshot_after=screenshot_after,
+            wait_for=wait_for,  # type: ignore[arg-type]
+            width=width,
+            height=height,
+        )
+    except RuntimeError as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+    except Exception as exc:
+        return [
+            TextContent(type="text", text=f"Unexpected error during navigation: {exc}")
+        ]
+
+    parts: list[TextContent | ImageContent] = []
+
+    # Build a step-by-step summary
+    lines = [f"Navigation complete.\n  url : {result['url']}\n"]
+    steps_executed: list[dict] = result.get("steps_executed", [])
+    if steps_executed:
+        lines.append(f"  steps ({len(steps_executed)}):")
+        for step in steps_executed:
+            lines.append(f"    [{step['step']}] {step['action']} — {step['detail']}")
+    parts.append(TextContent(type="text", text="\n".join(lines)))
+
+    # Inline intermediate screenshots (if any step had screenshot=true)
+    if return_inline:
+        for step in steps_executed:
+            spath = step.get("screenshot_path")
+            if spath:
+                step_text = TextContent(
+                    type="text",
+                    text=f"Step {step['step']} screenshot ({step['action']}):",
+                )
+                parts.append(step_text)
+                inline = _make_inline_png(spath)
+                if inline:
+                    parts.append(inline)
+
+    # Final screenshot
+    final_path: Optional[str] = result.get("final_screenshot")
+    if final_path:
+        if steps_executed:
+            parts.append(TextContent(type="text", text="Final screenshot:"))
+        inline = _make_inline_png(final_path)
+        if inline and return_inline:
+            parts.append(inline)
+        elif not return_inline:
+            parts.append(
+                TextContent(type="text", text=f"  final_screenshot : {final_path}")
+            )
+
+    return parts
 
 
 # ---------------------------------------------------------------------------
