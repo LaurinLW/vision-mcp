@@ -20,23 +20,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio numpy
+        run: uv sync --dev
 
       - name: Install Playwright browsers
-        run: playwright install --with-deps chromium
+        run: uv run playwright install --with-deps chromium
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: uv run pytest -v --tb=short
         env:
           VISION_OUTPUT_DIR: /tmp/opencode-vision-ci
 
