@@ -147,16 +147,18 @@ git clone https://github.com/LaurinLW/vision-mcp.git opencode-mcp
 cd opencode-mcp
 ```
 
-### 2. Install Python dependencies
+### 2. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+> Requires [uv](https://docs.astral.sh/uv/getting-started/installation/). This creates a `.venv` and installs all runtime and dev dependencies from `uv.lock`.
 
 ### 3. Install Playwright browser
 
 ```bash
-playwright install chromium
+uv run playwright install chromium
 ```
 
 ## Configure OpenCode
@@ -169,7 +171,7 @@ Add to your `opencode.jsonc`:
   "mcp": {
     "vision": {
       "type": "local",
-      "command": ["python", "/absolute/path/to/opencode-mcp/server.py"],
+      "command": ["uv", "run", "--project", "/absolute/path/to/opencode-mcp", "python", "/absolute/path/to/opencode-mcp/server.py"],
       "enabled": true
     }
   }
@@ -220,8 +222,7 @@ The server detects WSL automatically via `/proc/version` and routes desktop capt
 ## Running tests
 
 ```bash
-pip install pytest pytest-asyncio
-pytest tests/ -v
+uv run pytest -v
 ```
 
 Desktop tests are skipped automatically when not running inside WSL. Browser tests require Playwright + Chromium (`playwright install chromium`). The CI pipeline runs the full suite on every push.
@@ -231,7 +232,8 @@ Desktop tests are skipped automatically when not running inside WSL. Browser tes
 ```
 opencode-mcp/
 ├── server.py                   # MCP server entry point + tool definitions + handlers
-├── requirements.txt            # Python dependencies
+├── pyproject.toml              # Project metadata + dependencies (uv)
+├── uv.lock                     # Locked dependency versions
 ├── .github/workflows/ci.yml   # GitHub Actions CI (Python 3.11 + 3.12)
 ├── tests/
 │   └── test_vision.py          # pytest suite
